@@ -312,30 +312,47 @@ class AIWorkflowScope(models.Model):
 
         Returns: Dictionary with execution results
         """
+        from litellm.exceptions import (
+            AuthenticationError,
+            RateLimitError,
+            ContextWindowExceededError,
+            ServiceUnavailableError,
+        )
 
-        try:
-            # Load the orchestrator for this workflow
-            orchestrator = BaseOrchestrator.get_orchestrator(
-                workflow=self,
-                user=user,
-                context=running_context,
+        # --- MOCK ERRORS (Uncomment the one you want to test) ---
+
+
+        # 1. Mock Authentication Error (Invalid API Key)
+        # raise AuthenticationError(message="Invalid API Key", model="gpt-4", llm_provider="openai")
+
+        # 2. Mock Rate Limit Error
+        # raise RateLimitError(message="Rate limit reached", model="gpt-4", llm_provider="openai")
+
+        # 3. Mock Context Window Error (Text too long)
+        # raise ContextWindowExceededError(message="Context window exceeded", model="gpt-4", llm_provider="openai")
+
+        # 4. Mock Service Unavailable/Timeout
+        # raise ServiceUnavailableError(message="Service is overloaded", model="gpt-4", llm_provider="openai")
+
+        # 5. Mock General Internal Error
+        # raise Exception("Something went wrong internally")
+
+        # Load the orchestrator for this workflow
+        orchestrator = BaseOrchestrator.get_orchestrator(
+            workflow=self,
+            user=user,
+            context=running_context,
+        )
+
+        self.action = action
+
+        if not hasattr(orchestrator, action):
+            raise NotImplementedError(
+                f"Orchestrator '{self.profile.orchestrator_class}' does not implement action '{action}'"
             )
+        result = getattr(orchestrator, action)(user_input)
 
-            self.action = action
-
-            if not hasattr(orchestrator, action):
-                raise NotImplementedError(
-                    f"Orchestrator '{self.profile.orchestrator_class}' does not implement action '{action}'"
-                )
-            result = getattr(orchestrator, action)(user_input)
-
-            return result
-
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            return {
-                "error": f"Workflow execution failed: {str(e)}",
-                "status": "error",
-            }
+        return result
 
     def clean(self):
         """Validate the scope before saving."""

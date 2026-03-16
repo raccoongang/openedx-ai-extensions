@@ -5,8 +5,10 @@ Base classes to hold the logic of execution in ai workflows
 import json
 import logging
 
+import re
+
 from openedx_ai_extensions.processors import LLMProcessor, OpenEdXProcessor
-from openedx_ai_extensions.utils import is_generator, normalize_input_to_text
+from openedx_ai_extensions.utils import is_generator, normalize_input_to_text, STREAMING_FAILED_MESSAGE
 from openedx_ai_extensions.xapi.constants import EVENT_NAME_WORKFLOW_INITIALIZED, EVENT_NAME_WORKFLOW_INTERACTED
 
 from .session_based_orchestrator import SessionBasedOrchestrator
@@ -82,6 +84,13 @@ class ThreadedLLMResponse(SessionBasedOrchestrator):
             # 2. Save History (Post-Stream Phase)
             # This executes after the view has consumed the last chunk
             final_response = "".join(full_response_text)
+
+            # Sanitize: Remove "Kill-Signal" JSON markers and replace with standardized error message.
+            # This ensures that history saved to DB does not contain raw technical JSON.
+            if "||{\"error_in_stream\":" in final_response:
+                # Regex matches || followed by any characters until the next ||
+                final_response = re.sub(r"\|\|\{.*?\}\|\|", f"\n\n{STREAMING_FAILED_MESSAGE}", final_response)
+
             user_text = normalize_input_to_text(input_data)
 
             messages = [{"role": "assistant", "content": final_response}]
@@ -140,10 +149,10 @@ class ThreadedLLMResponse(SessionBasedOrchestrator):
 
         # 3. Process with LLM processor
         llm_processor = LLMProcessor(self.profile.processor_config, self.session)
-
-        chat_history = []
-        if llm_processor.get_provider() != "openai":
-            chat_history = submission_processor.get_full_message_history()
+        # TODO: check is this a really needed
+        # Always fetch history for all providers. This enables self-healing/fallback
+        # if a provider-specific threading ID (like OpenAI's remote_response_id) is lost.
+        chat_history = submission_processor.get_full_message_history() or []
 
         # Call the processor
         llm_result = llm_processor.process(
@@ -172,10 +181,11 @@ class ThreadedLLMResponse(SessionBasedOrchestrator):
         if user_text:
             messages.insert(0, {"role": "user", "content": user_text})
 
-        if llm_processor.get_provider() != "openai":
-            system_messages = llm_result.get("system_messages", {})
-            for msg in system_messages:
-                messages.insert(0, {"role": msg["role"], "content": msg["content"]})
+        # Save system messages (if present) so they are available in local history
+        # for fallback if remote threading is lost.
+        system_messages = llm_result.get("system_messages", [])
+        for msg in reversed(system_messages):
+            messages.insert(0, {"role": msg["role"], "content": msg["content"]})
 
         submission_processor.update_chat_submission(messages)
 
