@@ -27,6 +27,19 @@ class DirectLLMResponse(BaseOrchestrator):
     Does a single call to an LLM and gives a response.
     """
 
+    def _stream_and_emit(self, generator):
+        """Yield all chunks from the generator, then emit the completed event."""
+        try:
+            yield from generator
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error(f"Error in stream wrapper: {e}")
+            yield f"\n[Error processing stream: {e}]".encode("utf-8")
+        finally:
+            try:
+                self._emit_workflow_event(EVENT_NAME_WORKFLOW_COMPLETED)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.error(f"Failed to emit workflow event after stream: {e}")
+
     def run(self, input_data):
         """
         Executes the content fetching, LLM processing, and handles streaming
@@ -53,13 +66,12 @@ class DirectLLMResponse(BaseOrchestrator):
         llm_input_content = str(content_result)
 
         # --- 2. Process with LLM processor ---
-        llm_processor = LLMProcessor(self.profile.processor_config)
-        llm_result = llm_processor.process(context=llm_input_content)
+        self.llm_processor = LLMProcessor(self.profile.processor_config)
+        llm_result = self.llm_processor.process(context=llm_input_content)
 
         # --- 4. Handle Streaming Response (Generator) ---
         if is_generator(llm_result):
-            # If the LLM returns a generator, return its directly.
-            return llm_result
+            return self._stream_and_emit(llm_result)
 
         # --- 5. Handle LLM Error (Non-Streaming) ---
         if llm_result and 'error' in llm_result:
@@ -77,10 +89,6 @@ class DirectLLMResponse(BaseOrchestrator):
         response_data = {
             'response': llm_result.get('response', 'No response available'),
             'status': 'completed',
-            'metadata': {
-                'tokens_used': llm_result.get('tokens_used'),
-                'model_used': llm_result.get('model_used')
-            }
         }
         return response_data
 
@@ -125,13 +133,17 @@ class EducatorAssistantOrchestrator(SessionBasedOrchestrator):
     def _run_llm_processor(self, content_result, input_data):
         """Run the LLM processor to generate quiz questions."""
         with open(self._schema_path, 'r', encoding='utf-8') as f:
-            llm_processor = EducatorAssistantProcessor(
+            self.llm_processor = EducatorAssistantProcessor(
                 config=self.profile.processor_config,
                 user=self.user,
                 context=content_result,
                 extra_params={"response_format": json.load(f)}
             )
-        return llm_processor.process(input_data=input_data)
+        result = self.llm_processor.process(input_data=input_data)
+        # EducatorAssistantProcessor returns usage in the result dict rather than
+        # accumulating it on self.usage, so we sync it here for auto-lookup.
+        self.llm_processor.usage = result.get("usage") or None
+        return result
 
     def get_current_session_response(self, _):
         """
@@ -168,47 +180,6 @@ class EducatorAssistantOrchestrator(SessionBasedOrchestrator):
         if 'error' in llm_result:
             return {'error': llm_result['error'], 'status': 'LLMProcessor error'}
 
-        lib_key_str = input_data.get('library_id')
-
-        # TODO: Remove the direct-commit path once iterative review is fully supported in the UI
-        if lib_key_str:
-            # Legacy direct-commit path
-            items = []
-            for problem in llm_result.get("response", {}).get("problems", []):
-                try:
-                    olx_content = json_to_olx(problem)
-                    items.append(olx_content)
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.exception(f"Error converting problem to OLX: {e}")
-                    continue
-
-            library_processor = ContentLibraryProcessor(
-                library_key=lib_key_str,
-                user=self.user,
-                config=self.profile.processor_config
-            )
-            collection_key = library_processor.create_collection_and_add_items(
-                title=llm_result.get("response", {}).get("collection_name", "AI Generated Questions"),
-                description="AI-generated quiz questions",
-                items=items
-            )
-
-            self.session.metadata = {
-                "library_id": lib_key_str,
-                "collection_url": f"authoring/library/{lib_key_str}/collection/{collection_key}",
-                "collection_id": collection_key,
-            }
-            self.session.save(update_fields=["metadata"])
-            self._emit_workflow_event(EVENT_NAME_WORKFLOW_COMPLETED)
-            return {
-                'response': f"authoring/library/{lib_key_str}/collection/{collection_key}",
-                'status': 'completed',
-                'metadata': {
-                    'tokens_used': llm_result.get('tokens_used'),
-                    'model_used': llm_result.get('model_used')
-                }
-            }
-
         # Iterative path: store questions for review
         response_payload = llm_result.get("response", {}) or {}
         problems = response_payload.get("problems", []) or []
@@ -225,6 +196,9 @@ class EducatorAssistantOrchestrator(SessionBasedOrchestrator):
         metadata['collection_name'] = collection_name
         self.session.metadata = metadata
         self.session.save(update_fields=["metadata"])
+
+        self._emit_workflow_event(EVENT_NAME_WORKFLOW_COMPLETED)
+
         return {
             'status': 'completed',
             'response': {

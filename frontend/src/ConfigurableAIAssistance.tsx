@@ -24,15 +24,17 @@ import {
   AIRequestComponent,
   AIResponseComponent,
   AISidebarResponse,
-  AIEducatorLibraryAssistComponent,
-  AIEducatorLibraryResponseComponent,
 } from './components';
 import {
   LibraryProblemCreator,
   LibraryProblemCreatorResponse,
 } from './library-problem-creator';
+import {
+  FlashcardCreator,
+  FlashcardStudyResponse,
+} from './flashcard-study';
 import { PluginConfiguration } from './types';
-import { WORKFLOW_ACTIONS, WorkflowActionType } from './constants';
+import { WORKFLOW_ACTIONS, WorkflowActionType, NO_RESPONSE_MSG } from './constants';
 
 import messages from './messages';
 
@@ -42,10 +44,10 @@ import messages from './messages';
   ['AIRequestComponent', AIRequestComponent],
   ['AIResponseComponent', AIResponseComponent],
   ['AISidebarResponse', AISidebarResponse],
-  ['AIEducatorLibraryAssistComponent', AIEducatorLibraryAssistComponent],
-  ['AIEducatorLibraryResponseComponent', AIEducatorLibraryResponseComponent],
   ['LibraryProblemCreator', LibraryProblemCreator],
   ['LibraryProblemCreatorResponse', LibraryProblemCreatorResponse],
+  ['FlashcardCreator', FlashcardCreator],
+  ['FlashcardStudyResponse', FlashcardStudyResponse],
 ].forEach(([id, component]) => registerEntry(
   REGISTRY_NAMES.COMPONENTS,
   { id: id as string, component: component as React.ComponentType<any> },
@@ -283,20 +285,22 @@ const ConfigurableAIAssistance = ({
       } else if (data.error) {
         throw new Error(data.error);
       } else {
-        setResponse(JSON.stringify(data, null, 2));
+        setResponse(NO_RESPONSE_MSG);
         setHasAsked(true);
       }
 
       setHasAsked(true);
     } catch (err) {
       logError('[ConfigurableAIAssistance] AI Assistant Error:', err);
-      const userFriendlyError = formatErrorMessage(err);
+      const userFriendlyError = formatErrorMessage(err, intl);
       setError(userFriendlyError);
+      // Ensure we mark that we've tried to ask, so partial response remains visible if it was a stream error
+      setHasAsked(true);
       throw err;
     } finally {
       setIsLoading(false);
     }
-  }, [additionalProps, id]);
+  }, [additionalProps, id, intl]);
 
   const handleOpenSidebar = useCallback(() => {
     setOpenSidebarSignal((prev) => prev + 1);

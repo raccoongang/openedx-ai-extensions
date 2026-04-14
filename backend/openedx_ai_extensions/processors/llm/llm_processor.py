@@ -5,14 +5,16 @@ Responses processor for threaded AI conversations using LiteLLM
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from litellm import completion, get_responses, list_input_items, responses
+from litellm.exceptions import BadRequestError
 
 from openedx_ai_extensions.functions.decorators import AVAILABLE_TOOLS
 from openedx_ai_extensions.processors.llm.litellm_base_processor import LitellmProcessor
 from openedx_ai_extensions.processors.llm.providers import adapt_to_provider, after_tool_call_adaptations
 from openedx_ai_extensions.processors.llm.tool_executor import ToolExecutor
-from openedx_ai_extensions.utils import normalize_input_to_text
+from openedx_ai_extensions.utils import STREAMING_FAILED_MESSAGE, normalize_input_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -58,36 +60,31 @@ class LLMProcessor(LitellmProcessor):
 
     def _handle_streaming_completion(self, response):
         """Stream with chunk buffering (more natural UI speed)."""
-        total_tokens = None
         try:
             for chunk in response:
-                if hasattr(chunk, "usage") and chunk.usage:
-                    total_tokens = chunk.usage.total_tokens
-
+                self._set_token_usage(chunk)
                 content = chunk.choices[0].delta.content or ""
                 if content:
                     yield content.encode('utf-8')
 
         except Exception as e:  # pylint: disable=broad-exception-caught
+            # Log exact error, but yield sanitized JSON marker to UI
             logger.error(f"Error during AI streaming: {e}", exc_info=True)
-            yield f"\n[AI Error: {e}]".encode("utf-8")
-            return
-
-        # Log tokens at end
-        if total_tokens is not None:
-            logger.info(f"[LLM STREAM] Tokens used: {total_tokens}")
-        else:
-            logger.info("[LLM STREAM] Tokens used: unknown (model did not report)")
+            error_marker = json.dumps({
+                "error_in_stream": True,
+                "code": "streaming_failed",
+                "message": STREAMING_FAILED_MESSAGE
+            })
+            yield f"||{error_marker}||".encode("utf-8")
 
     def _handle_non_streaming_completion(self, response):
         """Handles the non-streaming logic, returning a response dict."""
         content = response.choices[0].message.content
-        total_tokens = response.usage.total_tokens if response.usage else 0
-        logger.info(f"[LLM NON-STREAM] Tokens used: {total_tokens}")
+        self._set_token_usage(response)
 
         return {
             "response": content,
-            "tokens_used": total_tokens,
+            "usage": self.usage,
             "model_used": self.provider,
             "status": "success",
         }
@@ -158,7 +155,7 @@ class LLMProcessor(LitellmProcessor):
         """
         yield from self._handle_streaming_tool_calls_responses(response, params or {})
 
-    def _call_responses_wrapper(self, params, initialize=False):
+    def _call_responses_wrapper(self, params, initialize=False, system_role=None):
         """
         Wrapper around LiteLLM responses() call.
         """
@@ -180,12 +177,10 @@ class LLMProcessor(LitellmProcessor):
             if response_id:
                 self.user_session.remote_response_id = response_id
                 self.user_session.save()
-            total_tokens = response.usage.total_tokens if response.usage else 0
-            logger.info(f"[LLM NON-STREAM] Tokens used: {total_tokens}")
 
             result = {
                 "response": content,
-                "tokens_used": total_tokens,
+                "usage": self.usage,
                 "model_used": self.extra_params.get("model", "unknown"),
                 "status": "success",
             }
@@ -194,10 +189,21 @@ class LLMProcessor(LitellmProcessor):
                 system_msgs = [msg for msg in params.get("input", []) if "role" in msg and msg["role"] == "system"]
                 result["system_messages"] = system_msgs
             return result
+        except BadRequestError as e:
+            error_code = getattr(e, "code", str(e))
+            if "previous_response_not_found" in str(error_code):
+                logger.warning(
+                    "Previous response ID '%s' not found. Clearing and retrying with full history fallback.",
+                    self.user_session.remote_response_id if self.user_session else "Unknown"
+                )
+                if self.user_session:
+                    self.user_session.remote_response_id = None
+                    self.user_session.save()
 
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.exception(f"Error calling LiteLLM: {e}")
-            return {"error": f"AI processing failed: {str(e)}"}
+                # Re-build params without previous_response_id and with full history
+                params = self._build_response_api_params(system_role=system_role)
+                return self._call_responses_wrapper(params=params, initialize=True, system_role=system_role)
+            raise
 
     def _call_completion_wrapper(self, system_role):
         """
@@ -213,6 +219,9 @@ class LLMProcessor(LitellmProcessor):
         }
         if self.caching_enabled:
             params["caching"] = True
+
+        if self.stream:
+            params["stream_options"] = {"include_usage": True}
 
         if self.context:
             params["messages"].append(
@@ -235,21 +244,13 @@ class LLMProcessor(LitellmProcessor):
             input_data=self.input_data,
         )
 
-        try:
-            # 1. Call the LiteLLM API
-            response = self._completion_with_tools(tool_calls=[], params=params)
-            # 2. Handle streaming response (Generator)
-            if self.stream:
-                return self._handle_streaming_completion(response)  # Return the generator object
-            else:
-                return self._handle_non_streaming_completion(response)  # Return the dictionary
-
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            # Catch errors that occur during the INITIAL API call (before streaming starts)
-            error_message = f"Error during initial AI completion call: {e}"
-            logger.exception(error_message, exc_info=True)
-            # Always return a dictionary error in this outer block
-            return {"error": f"AI processing failed: {str(e)}"}
+        # 1. Call the LiteLLM API
+        response = self._completion_with_tools(tool_calls=[], params=params)
+        # 2. Handle streaming response (Generator)
+        if self.stream:
+            return self._handle_streaming_completion(response)  # Return the generator object
+        else:
+            return self._handle_non_streaming_completion(response)  # Return the dictionary
 
     def _completion_with_tools(self, tool_calls, params):
         """Handle tool calls recursively until no more tool calls are present."""
@@ -310,6 +311,7 @@ class LLMProcessor(LitellmProcessor):
         tool_calls_buffer = {}
 
         for chunk in response:
+            self._set_token_usage(chunk)
             delta = chunk.choices[0].delta
             if delta.content:
                 yield chunk
@@ -331,15 +333,29 @@ class LLMProcessor(LitellmProcessor):
     # Responses API streaming helpers
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _get_chunk_token_usage(chunk) -> "int | None":
-        """Extract total token count from a Responses API streaming chunk, if present."""
-        chunk_response = getattr(chunk, "response", None)
+    def _set_token_usage(self, response) -> "int | None":
+        """Extract total token count from the response and save to self.usage for event emission."""
+
+        usage = None
+        chunk_response = getattr(response, "response", None)
         if chunk_response and getattr(chunk_response, "usage", None):
-            return chunk_response.usage.total_tokens
-        if getattr(chunk, "usage", None):
-            return chunk.usage.total_tokens
-        return None
+            usage = chunk_response.usage
+        if getattr(response, "usage", None):
+            usage = response.usage
+
+        if usage is None:
+            return
+
+        try:
+            if self.usage is not None:
+                self.usage.total_tokens += usage.total_tokens
+                self.usage.prompt_tokens += usage.prompt_tokens
+                self.usage.completion_tokens += usage.completion_tokens
+            else:
+                self.usage = usage
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.error(f"Error updating token usage: {e}")
+            self.usage = usage  # Fallback to latest usage if accumulation fails
 
     def _persist_response_id(self, chunk) -> None:
         """Save the response ID carried by *chunk* to the user session, if present."""
@@ -376,10 +392,9 @@ class LLMProcessor(LitellmProcessor):
         completed tool calls by executing them and recursing via _responses_with_tools.
         Parallel to _handle_streaming_tool_calls for the Completion API.
         """
-        total_tokens = None
         try:
             for chunk in response:
-                total_tokens = self._get_chunk_token_usage(chunk) or total_tokens
+                self._set_token_usage(chunk)
                 self._persist_response_id(chunk)
 
                 if hasattr(chunk, "delta") and chunk.delta and chunk.delta != "{}":
@@ -394,11 +409,19 @@ class LLMProcessor(LitellmProcessor):
 
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Error during streaming tool calls: %s", e, exc_info=True)
-            yield f"\n[AI Error: {e}]"
-            return
+            # Clear the remote response ID if it was partially saved but the stream failed
+            # This prevents subsequent calls from using an invalid/incomplete thread ID.
+            if self.user_session and self.user_session.remote_response_id:
+                self.user_session.remote_response_id = None
+                self.user_session.save()
 
-        if total_tokens is not None:
-            logger.info(f"[LLM STREAM] Tokens used: {total_tokens}")
+            error_marker = json.dumps({
+                "error_in_stream": True,
+                "code": "streaming_failed",
+                "message": STREAMING_FAILED_MESSAGE
+            })
+            yield f"||{error_marker}||"
+            return
 
     def _responses_with_tools(self, tool_calls, params):
         """Handle tool calls recursively until no more tool calls are present."""
@@ -472,8 +495,8 @@ class LLMProcessor(LitellmProcessor):
             """
         params = self._build_response_api_params(system_role=system_role)
         if self.user_session and self.user_session.remote_response_id:
-            return self._call_responses_wrapper(params=params)
-        return self._call_responses_wrapper(params=params, initialize=True)
+            return self._call_responses_wrapper(params=params, system_role=system_role)
+        return self._call_responses_wrapper(params=params, initialize=True, system_role=system_role)
 
     def summarize_content(self):
         """Summarize content using LiteLLM"""
@@ -651,3 +674,41 @@ class LLMProcessor(LitellmProcessor):
                 if summary_text:
                     items.append({"type": "reasoning", "role": "reasoning", "content": summary_text})
         return items
+
+    def generate_flashcards(self):
+        """Example method showing how to generate flashcards from content."""
+        prompt_file_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "prompts"
+            / "default_generate_flashcards.txt"
+        )
+        try:
+            with open(prompt_file_path, "r") as f:
+                prompt = f.read()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.exception(f"Error loading prompt template: {e}")
+            return {"error": "Failed to load prompt template."}
+
+        for key, value in self.input_data.items():
+            placeholder = f"{{{{{key.upper()}}}}}"
+            prompt = prompt.replace(placeholder, str(value))
+
+        self.input_data = None
+
+        try:
+            result = self._call_completion_wrapper(prompt)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.exception(f"Error calling LiteLLM: {e}")
+            return {"error": f"AI processing failed: {str(e)}"}
+
+        if "error" in result:
+            return result
+
+        response = json.loads(result['response'])
+
+        return {
+            "response": response,
+            "usage": self.usage,
+            "model_used": self.extra_params.get("model", "unknown"),
+            "status": "success",
+        }

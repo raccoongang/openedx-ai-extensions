@@ -46,12 +46,32 @@ def _mount_plugin(mounts, path):
 hooks.Filters.CONFIG_DEFAULTS.add_items([
     ("AI_EXTENSIONS_ENABLE_LLM_CACHE", False),
     ("AI_EXTENSIONS_LLM_CACHE", {}),
+    ("AI_EXTENSIONS_ENABLE_EVENT_BUS_CONSUMER", False),
 ])
 
 # Actually connects the patch files as tutor env patches
 for path in glob(str(importlib_resources.files("openedx_ai_extensions") / "patches" / "*")):
     with open(path, encoding="utf-8") as patch_file:
         hooks.Filters.ENV_PATCHES.add_item((os.path.basename(path), patch_file.read()))
+
+
+########################
+# Template rendering
+# Required for superset-extra-assets (datasets, charts, dashboards)
+########################
+
+hooks.Filters.ENV_TEMPLATE_ROOTS.add_items(
+    [
+        str(importlib_resources.files("openedx_ai_extensions") / "templates"),
+    ]
+)
+
+hooks.Filters.ENV_TEMPLATE_TARGETS.add_items(
+    [
+        ("openedx-ai-extensions/build", "plugins"),
+        ("openedx-ai-extensions/build/assets", "plugins"),
+    ],
+)
 
 
 ########################

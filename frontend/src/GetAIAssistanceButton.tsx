@@ -13,7 +13,7 @@ import {
   AIRequestComponent,
   AIResponseComponent,
 } from './components';
-import { WORKFLOW_ACTIONS } from './constants';
+import { NO_RESPONSE_MSG, WORKFLOW_ACTIONS } from './constants';
 import messages from './messages';
 
 interface GetAIAssistanceButtonProps {
@@ -99,7 +99,7 @@ const GetAIAssistanceButton = ({
         throw new Error(data.error);
       } else {
         // If API returns something but in unexpected format, try to use it
-        setResponse(JSON.stringify(data, null, 2));
+        setResponse(NO_RESPONSE_MSG);
         setHasAsked(true);
       }
 
@@ -109,12 +109,12 @@ const GetAIAssistanceButton = ({
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('AI Assistant Error:', err);
-      setError(formatErrorMessage(err));
+      setError(formatErrorMessage(err, intl));
       // DON'T set hasAsked to true on error - keep button available
     } finally {
       setIsLoading(false);
     }
-  }, [props, id]);
+  }, [props, id, intl]);
 
   /**
    * Reset component state for new request

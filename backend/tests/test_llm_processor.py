@@ -2,12 +2,14 @@
 Tests for the LLMProcessor module.
 """
 # pylint: disable=redefined-outer-name,protected-access
+import json
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 import pytest
 from django.contrib.auth import get_user_model
+from litellm.exceptions import BadRequestError
 from opaque_keys.edx.keys import CourseKey
 from opaque_keys.edx.locator import BlockUsageLocator
 
@@ -391,12 +393,8 @@ def test_chat_error_handling(
     Test API error handling in chat (non-streaming).
     """
     mock_responses.side_effect = Exception("API connection failed")
-
-    result = llm_processor.process(context="Ctx", input_data="Hi", chat_history=[])
-
-    assert "error" in result
-    assert "AI processing failed" in result["error"]
-    assert "API connection failed" in result["error"]
+    with pytest.raises(Exception):
+        llm_processor.process(context="Ctx", input_data="Hi", chat_history=[])
 
 
 @pytest.mark.django_db
@@ -425,7 +423,7 @@ def test_completion_error_handling_stream(
 
     # Should yield content then the error message
     assert results[0] == b"Start"
-    assert b"[AI Error: Stream cut off]" in results[1]
+    assert b'"error_in_stream": true' in results[1]
 
 
 # ============================================================================
@@ -1339,13 +1337,12 @@ class MockResponsesChunk:
 
 
 @pytest.mark.django_db
-@patch("openedx_ai_extensions.processors.llm.llm_processor.logger")
 @patch("openedx_ai_extensions.processors.llm.llm_processor.responses")
 def test_yield_threaded_stream_text_and_tokens(
-    mock_responses, mock_logger, llm_processor, user_session  # pylint: disable=W0621,W0613
+    mock_responses, llm_processor, user_session  # pylint: disable=W0621,W0613
 ):
     """
-    Test verifies text yielding and ensures token usage is LOGGED properly.
+    Test verifies text yielding and token usage tracking.
     """
     chunks = [
         MockResponsesChunk("response.created", response_id="resp_123"),
@@ -1364,12 +1361,6 @@ def test_yield_threaded_stream_text_and_tokens(
 
     user_session.refresh_from_db()
     assert user_session.remote_response_id == "resp_123"
-
-    found_token_log = any(
-        "Tokens used: 42" in str(args)
-        for args, _ in mock_logger.info.call_args_list
-    )
-    assert found_token_log, "Total tokens (42) were not logged as expected."
 
 
 @pytest.mark.django_db
@@ -1417,3 +1408,275 @@ def test_yield_threaded_stream_recursive_tool_call(
         assert history[1]["name"] == "roll_dice"
 
         mock_responses.assert_called_once()
+
+
+@pytest.mark.django_db
+@patch("openedx_ai_extensions.processors.llm.llm_processor.completion")
+def test_llm_processor_streaming_error_marker(mock_completion, workflow_scope, user):
+    """Test that LLMProcessor yields an error marker when an exception occurs during streaming."""
+    processor_config = {
+        "LLMProcessor": {
+            "provider": "default",
+            "stream": True,
+            "prompt": "Test prompt",
+        }
+    }
+
+    session = AIWorkflowSession.objects.create(
+        user=user,
+        scope=workflow_scope,
+        profile=workflow_scope.profile,
+        course_id=workflow_scope.course_id,
+    )
+
+    processor = LLMProcessor(processor_config, session)
+
+    # Mock completion to return a generator that raises an exception
+    class MockStreamResponse:
+        """Mock stream response."""
+        def __iter__(self):
+            chunk = Mock()
+            chunk.choices = [Mock(delta=Mock(content="Partial response"))]
+            yield chunk
+            raise RuntimeError("Streaming failed midway")
+
+    mock_completion.return_value = MockStreamResponse()
+
+    # Execute streaming
+    result = processor.process(input_data="test input")
+
+    chunks = list(result)
+    assert b"Partial response" in chunks
+
+    # Check for error marker in the last chunks
+    error_marker_found = False
+    for chunk in chunks:
+        if b"error_in_stream" in chunk:
+            error_marker_found = True
+            marker_str = chunk.decode("utf-8").strip("|")
+            data = json.loads(marker_str)
+            assert data["error_in_stream"] is True
+            assert data["code"] == "streaming_failed"
+
+    assert error_marker_found
+
+
+@pytest.mark.django_db
+@patch("openedx_ai_extensions.processors.llm.llm_processor.responses")
+def test_llm_processor_lost_thread_retry(mock_responses, workflow_scope, user):
+    """Test that LLMProcessor retries with full history if previous response ID is not found."""
+    processor_config = {
+        "LLMProcessor": {
+            "provider": "default",
+            "stream": False,
+            "prompt": "Test prompt",
+            "function": "chat_with_context",
+        }
+    }
+
+    session = AIWorkflowSession.objects.create(
+        user=user,
+        scope=workflow_scope,
+        profile=workflow_scope.profile,
+        course_id=workflow_scope.course_id,
+        remote_response_id="lost-id",
+    )
+
+    processor = LLMProcessor(processor_config, session)
+
+    # Mock responses to fail first time and succeed second time
+    mock_error = BadRequestError("Previous response not found", model="gpt-4", llm_provider="openai")
+    mock_error.code = "previous_response_not_found"
+
+    mock_success = Mock()
+    mock_success.id = "new-id"
+    item = Mock()
+    item.type = "message"
+    content_item = Mock()
+    content_item.type = "output_text"
+    content_item.text = "Success response"
+    item.content = [content_item]
+    mock_success.output = [item]
+    mock_success.usage = Mock(total_tokens=10)
+
+    mock_responses.side_effect = [mock_error, mock_success]
+
+    result = processor.process(input_data="test input")
+
+    assert result["response"] == "Success response"
+    assert session.remote_response_id == "new-id"  # Should have been updated with new ID
+    assert mock_responses.call_count == 2
+
+    # Verify first call had the lost ID
+    args, kwargs = mock_responses.call_args_list[0]
+    assert kwargs["previous_response_id"] == "lost-id"
+
+    # Verify second call did NOT have the lost ID
+    args, kwargs = mock_responses.call_args_list[1]
+    assert "previous_response_id" not in kwargs or kwargs["previous_response_id"] is None
+
+
+# ============================================================================
+# generate_flashcards Tests
+# ============================================================================
+
+
+@pytest.mark.django_db
+@patch("openedx_ai_extensions.processors.llm.llm_processor.completion")
+def test_generate_flashcards_success(
+    mock_completion, user_session, settings  # pylint: disable=redefined-outer-name
+):
+    """
+    Test that generate_flashcards loads the prompt template, replaces
+    placeholders, calls LLM, and returns parsed JSON response.
+    """
+    settings.AI_EXTENSIONS = {
+        "default": {
+            "MODEL": "openai/gpt-3.5-turbo",
+            "API_KEY": "test-key"
+        }
+    }
+
+    config = {
+        "LLMProcessor": {
+            "function": "generate_flashcards",
+            "model": "gpt-3.5-turbo",
+        }
+    }
+    processor = LLMProcessor(config=config, user_session=user_session)
+
+    flashcards_json = json.dumps({
+        "cards": [
+            {"id": "card-1", "question": "What is Python?", "answer": "A programming language."}
+        ]
+    })
+    mock_resp_obj = MockChunk(flashcards_json, is_stream=False)
+    mock_completion.return_value = mock_resp_obj
+
+    prompt_template = "Generate {{NUM_CARDS}} flashcards about {{TOPIC}}."
+    with patch("builtins.open", mock_open(read_data=prompt_template)):
+        result = processor.process(
+            input_data={"num_cards": "5", "topic": "Python"},
+        )
+
+    assert result["status"] == "success"
+    assert isinstance(result["response"], dict)
+    assert len(result["response"]["cards"]) == 1
+    assert result["response"]["cards"][0]["question"] == "What is Python?"
+
+    # Verify placeholder replacement was applied to the prompt
+    call_kwargs = mock_completion.call_args[1]
+    messages = call_kwargs["messages"]
+    system_msg = messages[0]["content"]
+    assert "5" in system_msg
+    assert "Python" in system_msg
+    assert "{{NUM_CARDS}}" not in system_msg
+    assert "{{TOPIC}}" not in system_msg
+
+
+@pytest.mark.django_db
+def test_generate_flashcards_prompt_file_error(
+    user_session, settings  # pylint: disable=redefined-outer-name
+):
+    """
+    Test that generate_flashcards returns an error when the prompt file cannot be loaded.
+    """
+    settings.AI_EXTENSIONS = {
+        "default": {
+            "MODEL": "openai/gpt-3.5-turbo",
+            "API_KEY": "test-key"
+        }
+    }
+
+    config = {
+        "LLMProcessor": {
+            "function": "generate_flashcards",
+            "model": "gpt-3.5-turbo",
+        }
+    }
+    processor = LLMProcessor(config=config, user_session=user_session)
+
+    with patch("builtins.open", side_effect=FileNotFoundError("prompt file not found")):
+        result = processor.process(
+            input_data={"num_cards": "5"},
+        )
+
+    assert "error" in result
+    assert result["error"] == "Failed to load prompt template."
+
+
+@pytest.mark.django_db
+@patch("openedx_ai_extensions.processors.llm.llm_processor.completion")
+def test_generate_flashcards_llm_api_error(
+    mock_completion, user_session, settings  # pylint: disable=redefined-outer-name
+):
+    """
+    Test that generate_flashcards returns an error when the LLM API call fails.
+    """
+    settings.AI_EXTENSIONS = {
+        "default": {
+            "MODEL": "openai/gpt-3.5-turbo",
+            "API_KEY": "test-key"
+        }
+    }
+
+    config = {
+        "LLMProcessor": {
+            "function": "generate_flashcards",
+            "model": "gpt-3.5-turbo",
+        }
+    }
+    processor = LLMProcessor(config=config, user_session=user_session)
+
+    mock_completion.side_effect = Exception("API connection refused")
+
+    prompt_template = "Generate {{NUM_CARDS}} flashcards."
+    with patch("builtins.open", mock_open(read_data=prompt_template)):
+        result = processor.process(
+            input_data={"num_cards": "3"},
+        )
+
+    assert "error" in result
+    assert "API connection refused" in result["error"]
+
+
+@pytest.mark.django_db
+@patch("openedx_ai_extensions.processors.llm.llm_processor.completion")
+def test_generate_flashcards_clears_input_data(
+    mock_completion, user_session, settings  # pylint: disable=redefined-outer-name
+):
+    """
+    Test that generate_flashcards clears self.input_data before calling the LLM
+    (so it's not passed as a user message by _call_completion_wrapper).
+    """
+    settings.AI_EXTENSIONS = {
+        "default": {
+            "MODEL": "openai/gpt-3.5-turbo",
+            "API_KEY": "test-key"
+        }
+    }
+
+    config = {
+        "LLMProcessor": {
+            "function": "generate_flashcards",
+            "model": "gpt-3.5-turbo",
+        }
+    }
+    processor = LLMProcessor(config=config, user_session=user_session)
+
+    flashcards_json = json.dumps({"cards": []})
+    mock_resp_obj = MockChunk(flashcards_json, is_stream=False)
+    mock_completion.return_value = mock_resp_obj
+
+    prompt_template = "Generate {{NUM_CARDS}} flashcards."
+    with patch("builtins.open", mock_open(read_data=prompt_template)):
+        processor.process(input_data={"num_cards": "3"})
+
+    # input_data should have been cleared before calling _call_completion_wrapper
+    assert processor.input_data is None
+
+    # Verify no user message was added (only system message + possibly context)
+    call_kwargs = mock_completion.call_args[1]
+    messages = call_kwargs["messages"]
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    assert len(user_messages) == 0

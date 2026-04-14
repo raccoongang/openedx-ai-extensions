@@ -29,7 +29,7 @@ import {
   formatErrorMessage,
 } from '../services';
 import { AIChatMessage, AIModelResponse, PluginContext } from '../types';
-import { WORKFLOW_ACTIONS } from '../constants';
+import { WORKFLOW_ACTIONS, NO_RESPONSE_MSG } from '../constants';
 
 import messages from '../messages';
 import './sidebar.scss';
@@ -514,7 +514,7 @@ const AISidebarResponse = ({
         } else if (data.result) {
           aiResponse = data.result;
         } else {
-          aiResponse = JSON.stringify(data, null, 2);
+          aiResponse = NO_RESPONSE_MSG;
         }
 
         // Update the AI placeholder with the final response
@@ -537,7 +537,7 @@ const AISidebarResponse = ({
       }
     } catch (err) {
       logError('[AISidebarResponse] Follow-up error:', err);
-      const userFriendlyError = formatErrorMessage(err);
+      const userFriendlyError = formatErrorMessage(err, intl);
       // Add error message to chat
       setChatMessages(prev => [...prev, {
         type: 'error',
@@ -546,6 +546,7 @@ const AISidebarResponse = ({
       }]);
     } finally {
       setIsSendingFollowUp(false);
+      textareaRef.current?.focus();
     }
   };
 
@@ -748,15 +749,17 @@ const AISidebarResponse = ({
               className="ai-sidebar-chat-input"
             />
             {/* Send button positioned inside textarea */}
-            <Button
-              size="sm"
-              className="ai-sidebar-chat-button zindex-1"
-              onClick={handleFollowUpSubmit}
-              disabled={isLoading || isSendingFollowUp || !followUpQuestion.trim()}
-              aria-label={intl.formatMessage(messages['ai.extensions.sidebar.send.label'])}
-            >
-              <Icon src={Send} aria-hidden="true" size="xs" />
-            </Button>
+            <div className="ai-sidebar-chat-button-wrapper">
+              <Button
+                size="sm"
+                className="ai-sidebar-chat-button zindex-1"
+                onClick={handleFollowUpSubmit}
+                disabled={isLoading || isSendingFollowUp || !followUpQuestion.trim()}
+                aria-label={intl.formatMessage(messages['ai.extensions.sidebar.send.label'])}
+              >
+                <Icon src={Send} aria-hidden="true" size="xs" />
+              </Button>
+            </div>
           </div>
         )}
       </div>
