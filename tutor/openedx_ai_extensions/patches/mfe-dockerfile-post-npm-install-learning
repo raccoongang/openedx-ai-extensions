@@ -1,3 +1,4 @@
 ### POST NPM PATCH LEARNING
-RUN npm install --legacy-peer-deps --install-links /openedx/ai-extensions-frontend
+RUN cd /openedx/ai-extensions-frontend && npm pack --pack-destination /tmp && \
+    cd /openedx/app && npm install --legacy-peer-deps /tmp/openedx-openedx-ai-extensions-ui-*.tgz
 ##

@@ -2,6 +2,6 @@
 COPY --from=ai-extensions-frontend / /openedx/ai-extensions-frontend
 
 WORKDIR /openedx/ai-extensions-frontend
-RUN npm install && npm run build
+RUN npm install && npm run build && rm -rf node_modules
 WORKDIR /openedx/app
 ##
